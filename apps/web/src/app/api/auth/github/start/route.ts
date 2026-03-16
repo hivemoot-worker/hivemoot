@@ -15,12 +15,9 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { validateEnv } from "@/server/env";
+import { buildOAuthAuthorizeRedirect, getOAuthStartConfig } from "@/server/github-auth";
 import { getRedisClient } from "@/server/redis";
-import { createOAuthState, OAUTH_STATE_BINDING_COOKIE } from "@/server/setup-session";
-
-const GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize";
-const OAUTH_STATE_COOKIE_MAX_AGE = 600; // 10 minutes, aligned with Redis state TTL
+import { createOAuthState } from "@/server/setup-session";
 
 function setupErrorRedirect(
   request: NextRequest,
@@ -37,19 +34,12 @@ export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const installationId = searchParams.get("installation_id") ?? undefined;
 
-  const env = validateEnv();
-  if (!env.ok) {
+  const configResult = getOAuthStartConfig();
+  if (!configResult.ok) {
     return setupErrorRedirect(request, "server_misconfiguration", installationId);
   }
 
-  const { githubClientId, githubClientSecret, redisRestUrl, redisRestToken, siteUrl } = env.config;
-
-  if (!githubClientId || !githubClientSecret) {
-    return setupErrorRedirect(request, "server_misconfiguration", installationId);
-  }
-  if (!redisRestUrl || !redisRestToken) {
-    return setupErrorRedirect(request, "server_misconfiguration", installationId);
-  }
+  const { githubClientId, redisRestUrl, redisRestToken, siteUrl } = configResult.config;
 
   if (!installationId || !/^\d+$/.test(installationId)) {
     // Missing installation_id is a malformed link — redirect to setup root without an id
@@ -66,21 +56,10 @@ export async function GET(request: NextRequest) {
     return setupErrorRedirect(request, "oauth_state_store_failed", installationId);
   }
 
-  const callbackUrl = `${siteUrl}/api/auth/github/callback`;
-  const authorizeUrl = new URL(GITHUB_AUTHORIZE_URL);
-  authorizeUrl.searchParams.set("client_id", githubClientId);
-  authorizeUrl.searchParams.set("redirect_uri", callbackUrl);
-  authorizeUrl.searchParams.set("state", stateRecord.state);
-  // Request minimum scopes: we only need to read org membership
-  authorizeUrl.searchParams.set("scope", "read:org");
-
-  const response = NextResponse.redirect(authorizeUrl.toString());
-  response.cookies.set(OAUTH_STATE_BINDING_COOKIE, stateRecord.stateBinding, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "lax",
-    maxAge: OAUTH_STATE_COOKIE_MAX_AGE,
-    path: "/",
+  return buildOAuthAuthorizeRedirect({
+    githubClientId,
+    siteUrl,
+    state: stateRecord.state,
+    stateBinding: stateRecord.stateBinding,
   });
-  return response;
 }

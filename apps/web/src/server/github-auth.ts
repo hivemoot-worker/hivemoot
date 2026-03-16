@@ -2,6 +2,8 @@
  * GitHub authentication helpers.
  *
  * - generateAppJwt: creates a short-lived GitHub App JWT (RS256) for App-level API calls
+ * - getOAuthStartConfig: validates the shared config needed by OAuth start routes
+ * - buildOAuthAuthorizeRedirect: builds the OAuth redirect URL and binds the CSRF cookie
  * - exchangeOAuthCode: exchanges an OAuth authorization code for a user access token
  * - getAuthenticatedUser: fetches the authenticated GitHub user's identity
  * - getInstallation: fetches installation metadata using the App JWT
@@ -9,6 +11,80 @@
  */
 
 import { createSign } from "crypto";
+import { NextResponse } from "next/server";
+import { validateEnv } from "@/server/env";
+import { OAUTH_STATE_BINDING_COOKIE } from "@/server/setup-session";
+
+export const GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize";
+export const OAUTH_STATE_COOKIE_MAX_AGE = 600;
+
+export interface OAuthStartConfig {
+  githubClientId: string;
+  redisRestUrl: string;
+  redisRestToken: string;
+  siteUrl: string;
+}
+
+export type OAuthStartConfigResult =
+  | { ok: true; config: OAuthStartConfig }
+  | {
+      ok: false;
+      reason:
+        | "server_misconfiguration"
+        | "github_oauth_not_configured"
+        | "session_storage_not_configured";
+    };
+
+export function getOAuthStartConfig(): OAuthStartConfigResult {
+  const env = validateEnv();
+  if (!env.ok) {
+    return { ok: false, reason: "server_misconfiguration" };
+  }
+
+  const { githubClientId, githubClientSecret, redisRestUrl, redisRestToken, siteUrl } = env.config;
+
+  if (!githubClientId || !githubClientSecret) {
+    return { ok: false, reason: "github_oauth_not_configured" };
+  }
+  if (!redisRestUrl || !redisRestToken) {
+    return { ok: false, reason: "session_storage_not_configured" };
+  }
+
+  return {
+    ok: true,
+    config: { githubClientId, redisRestUrl, redisRestToken, siteUrl },
+  };
+}
+
+export function buildOAuthAuthorizeRedirect({
+  githubClientId,
+  siteUrl,
+  state,
+  stateBinding,
+}: {
+  githubClientId: string;
+  siteUrl: string;
+  state: string;
+  stateBinding: string;
+}): NextResponse {
+  const callbackUrl = `${siteUrl}/api/auth/github/callback`;
+  const authorizeUrl = new URL(GITHUB_AUTHORIZE_URL);
+  authorizeUrl.searchParams.set("client_id", githubClientId);
+  authorizeUrl.searchParams.set("redirect_uri", callbackUrl);
+  authorizeUrl.searchParams.set("state", state);
+  authorizeUrl.searchParams.set("scope", "read:org");
+
+  const response = NextResponse.redirect(authorizeUrl.toString());
+  response.cookies.set(OAUTH_STATE_BINDING_COOKIE, stateBinding, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    maxAge: OAUTH_STATE_COOKIE_MAX_AGE,
+    path: "/",
+  });
+
+  return response;
+}
 
 // ---------------------------------------------------------------------------
 // App JWT
