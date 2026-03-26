@@ -43,6 +43,11 @@ jobs:
     needs: typecheck-test-build
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    concurrency:
+      group: cli-publish-main
+      cancel-in-progress: false
+    permissions:
+      contents: write
     defaults:
       run:
         working-directory: cli
@@ -50,6 +55,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -59,17 +67,60 @@ jobs:
           cache-dependency-path: cli/package-lock.json
           registry-url: 'https://registry.npmjs.org'
 
+      # If main already carries the npm-published version, bump patch on main and
+      # let the bump-triggered workflow run publish the new version.
+      - name: Auto-bump patch version on main when needed
+        id: version
+        run: |
+          git checkout -B main origin/main
+
+          PACKAGE_NAME=$(node -p "require('./package.json').name")
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          NPM_LATEST=$(npm view "${PACKAGE_NAME}" version 2>/dev/null || echo "0.0.0")
+
+          echo "package_name=${PACKAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "package_version=${PACKAGE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "npm_latest=${NPM_LATEST}" >> "$GITHUB_OUTPUT"
+
+          if [ "${PACKAGE_VERSION}" = "${NPM_LATEST}" ]; then
+            npm version patch --no-git-tag-version
+            NEW_VERSION=$(node -p "require('./package.json').version")
+
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add package.json package-lock.json
+            git commit -m "chore(cli): auto-bump version to ${NEW_VERSION}"
+            git pull --rebase origin main
+            git push origin HEAD:main
+
+            echo "package_version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "pushed_bump=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pushed_bump=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install dependencies
+        if: steps.version.outputs.pushed_bump != 'true'
         run: npm ci
 
+      - name: Type check
+        if: steps.version.outputs.pushed_bump != 'true'
+        run: npm run typecheck
+
+      - name: Test
+        if: steps.version.outputs.pushed_bump != 'true'
+        run: npm run test
+
       - name: Build
+        if: steps.version.outputs.pushed_bump != 'true'
         run: npm run build
 
       - name: Check if version is already published
+        if: steps.version.outputs.pushed_bump != 'true'
         id: check
         run: |
-          PACKAGE_VERSION=$(node -p "require('./package.json').version")
-          PACKAGE_NAME=$(node -p "require('./package.json').name")
+          PACKAGE_NAME="${{ steps.version.outputs.package_name }}"
+          PACKAGE_VERSION="${{ steps.version.outputs.package_version }}"
           if npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version 2>/dev/null; then
             echo "published=true" >> "$GITHUB_OUTPUT"
           else
@@ -77,7 +128,7 @@ jobs:
           fi
 
       - name: Publish to npm
-        if: steps.check.outputs.published == 'false'
+        if: steps.version.outputs.pushed_bump != 'true' && steps.check.outputs.published == 'false'
         run: npm publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
